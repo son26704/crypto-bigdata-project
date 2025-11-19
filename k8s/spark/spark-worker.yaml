@@ -1,0 +1,62 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spark-worker
+  namespace: crypto-bigdata
+spec:
+  serviceName: spark-worker
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spark-worker
+  template:
+    metadata:
+      labels:
+        app: spark-worker
+    spec:
+      containers:
+      - name: spark-worker
+        image: apache/spark:3.5.0
+        ports:
+        - containerPort: 8081
+          name: ui
+        command:
+        - /bin/bash
+        - -c
+        - |
+          /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker \
+            spark://spark-master:7077 \
+            --cores 1 \
+            --memory 768M \
+            --webui-port 8081
+        resources:
+          requests:
+            memory: "1024Mi"
+            cpu: "400m"
+          limits:
+            memory: "1536Mi"
+            cpu: "800m"
+        volumeMounts:
+        - name: work
+          mountPath: /opt/spark/work
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 10
+  volumeClaimTemplates:
+  - metadata:
+      name: work
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 2Gi

@@ -1,0 +1,508 @@
+{% extends "base.html" %}
+
+{% block title %}Charts - Crypto Dashboard{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="fas fa-chart-line"></i> Price Charts & Analytics</span>
+                <div>
+                    <button class="btn btn-sm btn-light" onclick="loadAllCharts()" title="Refresh Charts">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <!-- Compact Controls -->
+                <div class="row g-3 mb-4">
+                    <div class="col-md-4 col-lg-3">
+                        <label class="form-label fw-bold small">
+                            <i class="fas fa-coins"></i> Cryptocurrencies:
+                        </label>
+                        <select class="form-select form-select-sm" id="symbolSelect" multiple size="5">
+                            <option value="BTC" selected>Bitcoin (BTC)</option>
+                            <option value="ETH">Ethereum (ETH)</option>
+                            <option value="USDT">Tether (USDT)</option>
+                            <option value="XRP">XRP (XRP)</option>
+                            <option value="BNB">BNB (BNB)</option>
+                            <option value="SOL">Solana (SOL)</option>
+                            <option value="ADA">Cardano (ADA)</option>
+                            <option value="DOGE">Dogecoin (DOGE)</option>
+                        </select>
+                        <small class="text-muted d-block mt-1">
+                            <i class="fas fa-info-circle"></i> Hold Ctrl/Cmd for multiple
+                        </small>
+                    </div>
+
+                    <div class="col-md-4 col-lg-3">
+                        <label class="form-label fw-bold small">
+                            <i class="fas fa-clock"></i> Time Range:
+                        </label>
+                        <select class="form-select form-select-sm" id="timeRange">
+                            <option value="50">Last 50 points (~25 min)</option>
+                            <option value="100" selected>Last 100 points (~50 min)</option>
+                            <option value="200">Last 200 points (~100 min)</option>
+                            <option value="500">Last 500 points (~4 hours)</option>
+                        </select>
+
+                        <label class="form-label fw-bold small mt-2">
+                            <i class="fas fa-chart-area"></i> Chart Type:
+                        </label>
+                        <select class="form-select form-select-sm" id="chartType">
+                            <option value="line">Line Chart</option>
+                            <option value="area">Area Chart</option>
+                            <option value="bar">Bar Chart</option>
+                        </select>
+                    </div>
+
+                    <div class="col-md-4 col-lg-6">
+                        <label class="form-label fw-bold small">Quick Actions:</label>
+                        <div class="d-grid gap-2">
+                            <button class="btn btn-primary btn-sm" onclick="loadAllCharts()">
+                                <i class="fas fa-chart-line"></i> Update All Charts
+                            </button>
+                            <button class="btn btn-outline-secondary btn-sm" onclick="selectTopCoins()">
+                                <i class="fas fa-star"></i> Select Top 3 Coins
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Main Price Chart -->
+                <div class="chart-container" style="position: relative; height: 400px;">
+                    <canvas id="priceChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Moving Averages Chart -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-chart-area"></i> Moving Averages Analysis
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Select Coin for MA Analysis:</label>
+                    <select class="form-select" id="maSymbolSelect" style="max-width: 300px;">
+                        <option value="BTC" selected>Bitcoin (BTC)</option>
+                        <option value="ETH">Ethereum (ETH)</option>
+                        <option value="XRP">XRP (XRP)</option>
+                        <option value="BNB">BNB (BNB)</option>
+                        <option value="SOL">Solana (SOL)</option>
+                    </select>
+                </div>
+                <div class="chart-container" style="position: relative; height: 350px;">
+                    <canvas id="maChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Volume Analysis -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-chart-bar"></i> Trading Volume Comparison
+            </div>
+            <div class="card-body">
+                <div class="chart-container" style="position: relative; height: 300px;">
+                    <canvas id="volumeChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.chart-container {
+    position: relative;
+    margin: auto;
+}
+
+#symbolSelect option:checked {
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-dark) 100%);
+    color: white;
+}
+
+.form-select:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+}
+</style>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    let priceChart = null;
+    let maChart = null;
+    let volumeChart = null;
+    const chartColors = [
+        '#4f46e5', '#10b981', '#ef4444', '#f59e0b', '#8b5cf6',
+        '#06b6d4', '#ec4899', '#14b8a6', '#f97316', '#84cc16'
+    ];
+
+    function getChartConfig(type) {
+        const configs = {
+            line: {
+                fill: false,
+                borderWidth: 2,
+                pointRadius: 0,
+                pointHoverRadius: 5,
+                tension: 0.4
+            },
+            area: {
+                fill: true,
+                borderWidth: 2,
+                pointRadius: 0,
+                pointHoverRadius: 5,
+                tension: 0.4
+            },
+            bar: {
+                borderWidth: 1
+            }
+        };
+        return configs[type] || configs.line;
+    }
+
+    function createGradient(ctx, color) {
+        const gradient = ctx.createLinearGradient(0, 0, 0, 400);
+        gradient.addColorStop(0, color + '40');
+        gradient.addColorStop(1, color + '00');
+        return gradient;
+    }
+
+    async function loadMultiCoinChart() {
+        const selectedSymbols = Array.from($('#symbolSelect').val() || ['BTC']);
+        const timeRange = $('#timeRange').val();
+        const chartType = $('#chartType').val();
+
+        if (selectedSymbols.length === 0) {
+            alert('Please select at least one cryptocurrency');
+            return;
+        }
+
+        // Destroy existing chart FIRST before any other operations
+        if (priceChart) {
+            priceChart.destroy();
+            priceChart = null;
+        }
+
+        const datasets = [];
+
+        for (let i = 0; i < selectedSymbols.length; i++) {
+            const symbol = selectedSymbols[i];
+            const color = chartColors[i % chartColors.length];
+
+            try {
+                const response = await $.get(`/api/price-history/${symbol}?limit=${timeRange}`);
+                const data = response.data;
+
+                if (data && data.length > 0) {
+                    const config = getChartConfig(chartType);
+
+                    datasets.push({
+                        label: `${symbol} Price (USD)`,
+                        data: data.map(d => ({
+                            x: new Date(d.timestamp),
+                            y: d.price
+                        })),
+                        borderColor: color,
+                        backgroundColor: chartType === 'area' ? color + '30' : color,
+                        ...config
+                    });
+                }
+            } catch (error) {
+                console.error(`Failed to load data for ${symbol}:`, error);
+            }
+        }
+
+        // Create chart only after all data is loaded
+        const ctx = document.getElementById('priceChart').getContext('2d');
+
+        priceChart = new Chart(ctx, {
+            type: chartType === 'bar' ? 'bar' : 'line',
+            data: { datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                plugins: {
+                    legend: {
+                        display: true,
+                        position: 'top',
+                        labels: {
+                            color: 'var(--text-primary)',
+                            font: { size: 12, weight: 'bold' },
+                            usePointStyle: true,
+                            padding: 15
+                        }
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                        titleColor: 'var(--text-primary)',
+                        bodyColor: 'var(--text-primary)',
+                        borderColor: 'var(--border-color)',
+                        borderWidth: 1,
+                        padding: 12,
+                        displayColors: true,
+                        callbacks: {
+                            label: function(context) {
+                                return context.dataset.label + ': $' + context.parsed.y.toFixed(2);
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        type: 'time',
+                        time: {
+                            unit: 'minute',
+                            displayFormats: {
+                                minute: 'HH:mm'
+                            }
+                        },
+                        ticks: {
+                            color: 'var(--text-secondary)',
+                            maxTicksLimit: 12
+                        },
+                        grid: {
+                            color: 'var(--border-color)',
+                            drawBorder: false
+                        }
+                    },
+                    y: {
+                        ticks: {
+                            color: 'var(--text-secondary)',
+                            callback: function(value) {
+                                return '$' + value.toLocaleString();
+                            }
+                        },
+                        grid: {
+                            color: 'var(--border-color)',
+                            drawBorder: false
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async function loadMAChart() {
+        const symbol = $('#maSymbolSelect').val();
+        const timeRange = $('#timeRange').val();
+
+        try {
+            const response = await $.get(`/api/price-history/${symbol}?limit=${timeRange}`);
+            const rawData = response.data;
+
+            // Get MA data from realtime_prices table
+            const maResponse = await $.get('/api/realtime-prices');
+            const coinData = maResponse.find(c => c.symbol === symbol);
+
+            const ctx = document.getElementById('maChart').getContext('2d');
+
+            if (maChart) {
+                maChart.destroy();
+            }
+
+            maChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: rawData.map(d => new Date(d.timestamp).toLocaleTimeString()),
+                    datasets: [
+                        {
+                            label: 'Price',
+                            data: rawData.map(d => d.price),
+                            borderColor: '#4f46e5',
+                            backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true
+                        },
+                        {
+                            label: 'MA 5min',
+                            data: rawData.map(() => coinData?.ma_5min || null),
+                            borderColor: '#10b981',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            tension: 0.4,
+                            fill: false,
+                            pointRadius: 0
+                        },
+                        {
+                            label: 'MA 15min',
+                            data: rawData.map(() => coinData?.ma_15min || null),
+                            borderColor: '#f59e0b',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            tension: 0.4,
+                            fill: false,
+                            pointRadius: 0
+                        },
+                        {
+                            label: 'MA 1hour',
+                            data: rawData.map(() => coinData?.ma_1hour || null),
+                            borderColor: '#ef4444',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            tension: 0.4,
+                            fill: false,
+                            pointRadius: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: 'var(--text-primary)',
+                                font: { size: 11, weight: 'bold' }
+                            }
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                            titleColor: 'var(--text-primary)',
+                            bodyColor: 'var(--text-primary)',
+                            borderColor: 'var(--border-color)',
+                            borderWidth: 1
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                color: 'var(--text-secondary)',
+                                maxTicksLimit: 10
+                            },
+                            grid: { color: 'var(--border-color)' }
+                        },
+                        y: {
+                            ticks: {
+                                color: 'var(--text-secondary)',
+                                callback: value => '$' + value.toFixed(2)
+                            },
+                            grid: { color: 'var(--border-color)' }
+                        }
+                    }
+                }
+            });
+        } catch (error) {
+            console.error('Failed to load MA chart:', error);
+        }
+    }
+
+    async function loadVolumeChart() {
+        try {
+            const response = await $.get('/api/realtime-prices');
+            const data = response.slice(0, 10); // Top 10 coins
+
+            const ctx = document.getElementById('volumeChart').getContext('2d');
+
+            if (volumeChart) {
+                volumeChart.destroy();
+            }
+
+            volumeChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.map(c => c.symbol),
+                    datasets: [{
+                        label: '24h Trading Volume (USD)',
+                        data: data.map(c => c.volume_24h),
+                        backgroundColor: chartColors,
+                        borderColor: chartColors.map(c => c + 'ff'),
+                        borderWidth: 2,
+                        borderRadius: 8,
+                        borderSkipped: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                            titleColor: 'var(--text-primary)',
+                            bodyColor: 'var(--text-primary)',
+                            borderColor: 'var(--border-color)',
+                            borderWidth: 1,
+                            callbacks: {
+                                label: function(context) {
+                                    const value = context.parsed.y;
+                                    if (value >= 1e9) return '$' + (value / 1e9).toFixed(2) + 'B';
+                                    if (value >= 1e6) return '$' + (value / 1e6).toFixed(2) + 'M';
+                                    return '$' + value.toLocaleString();
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                color: 'var(--text-primary)',
+                                font: { size: 12, weight: 'bold' }
+                            },
+                            grid: { display: false }
+                        },
+                        y: {
+                            ticks: {
+                                color: 'var(--text-secondary)',
+                                callback: function(value) {
+                                    if (value >= 1e9) return '$' + (value / 1e9).toFixed(1) + 'B';
+                                    if (value >= 1e6) return '$' + (value / 1e6).toFixed(1) + 'M';
+                                    return '$' + (value / 1e3).toFixed(0) + 'K';
+                                }
+                            },
+                            grid: { color: 'var(--border-color)' }
+                        }
+                    }
+                }
+            });
+        } catch (error) {
+            console.error('Failed to load volume chart:', error);
+        }
+    }
+
+    function selectTopCoins() {
+        // Clear current selection
+        $('#symbolSelect option').prop('selected', false);
+        // Select top 3
+        $('#symbolSelect option:lt(3)').prop('selected', true);
+        loadMultiCoinChart();
+    }
+
+    function loadAllCharts() {
+        loadMultiCoinChart();
+        loadMAChart();
+        loadVolumeChart();
+    }
+
+    $(document).ready(function() {
+        console.log('Charts page initialized');
+        loadAllCharts();
+
+        $('#symbolSelect').change(loadMultiCoinChart);
+        $('#timeRange').change(loadAllCharts);
+        $('#chartType').change(loadMultiCoinChart);
+        $('#maSymbolSelect').change(loadMAChart);
+
+        // Auto-refresh every 30 seconds
+        setInterval(loadAllCharts, 30000);
+    });
+</script>
+{% endblock %}
