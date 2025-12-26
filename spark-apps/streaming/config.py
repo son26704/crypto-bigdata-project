@@ -1,3 +1,4 @@
+# spark-apps/streaming/config.py
 KAFKA_BOOTSTRAP_SERVERS = "kafka-0.kafka.crypto-bigdata.svc.cluster.local:9092"
 KAFKA_TOPIC = "crypto-prices"
 

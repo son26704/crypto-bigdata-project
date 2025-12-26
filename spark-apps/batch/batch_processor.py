@@ -1,3 +1,4 @@
+# spark-apps/batch/batch_processor.py
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, avg, min, max, sum, count, stddev,

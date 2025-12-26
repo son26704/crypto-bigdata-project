@@ -3,20 +3,10 @@ import pandas as pd
 import psycopg2
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
-import datetime
 
-# --- 1. CẤU HÌNH TRANG & KẾT NỐI ---
-st.set_page_config(
-    page_title="Crypto Big Data Monitor",
-    page_icon="📊",
-    layout="wide", # Chế độ toàn màn hình
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Crypto Big Data Dashboard", page_icon="💎", layout="wide")
+st_autorefresh(interval=30000, key="datarefresh") # Refresh sau 30 giây
 
-# Tự động refresh trang mỗi 30 giây (phù hợp với Spark Trigger)
-st_autorefresh(interval=30000, key="datarefresh")
-
-# Config Database (Kết nối qua Port-forward)
 DB_CONFIG = {
     "dbname": "cryptodb",
     "user": "cryptouser",
@@ -26,177 +16,181 @@ DB_CONFIG = {
 }
 
 @st.cache_resource
-def get_db_connection():
-    """Tạo kết nối DB (Cache để không phải connect lại liên tục)"""
-    try:
-        return psycopg2.connect(**DB_CONFIG)
-    except Exception as e:
-        st.error(f"🔴 Lỗi kết nối DB: {e}")
-        return None
+def get_conn():
+    return psycopg2.connect(**DB_CONFIG)
 
-# --- 2. HÀM LẤY DỮ LIỆU ---
-def get_symbols():
-    """Lấy danh sách các đồng coin đang có trong DB"""
-    conn = get_db_connection()
-    if not conn: return []
-    query = "SELECT DISTINCT symbol FROM realtime_prices ORDER BY symbol;"
-    df = pd.read_sql(query, conn)
-    return df['symbol'].tolist()
+# --- QUERY DATA ---
+def get_coin_list():
+    conn = get_conn()
+    return pd.read_sql("SELECT DISTINCT symbol, name, image FROM realtime_prices ORDER BY symbol", conn)
 
 def get_realtime_data(symbol, limit=200):
-    """Lấy dữ liệu Realtime để vẽ Line Chart"""
-    conn = get_db_connection()
+    """Lấy dữ liệu Realtime cho 1 coin"""
+    conn = get_conn()
     query = f"""
-        SELECT timestamp, price, ma_5min, volume_24h 
-        FROM realtime_prices 
-        WHERE symbol = '{symbol}' 
-        ORDER BY timestamp DESC 
-        LIMIT {limit}
+        SELECT * FROM realtime_prices 
+        WHERE symbol = '{symbol}' ORDER BY timestamp DESC LIMIT {limit}
     """
-    df = pd.read_sql(query, conn)
-    return df.sort_values(by="timestamp")
+    # Lấy 200 bản ghi, sau đó sắp xếp lại theo thời gian tăng dần
+    return pd.read_sql(query, conn).sort_values("timestamp")
 
-def get_hourly_data(symbol):
-    """Lấy dữ liệu Hourly Stats để vẽ Nến (Candlestick)"""
-    conn = get_db_connection()
-    # Lấy 72 giờ gần nhất
+def get_hourly_stats(symbol):
+    """Lấy dữ liệu Batch (hourly) cho Bảng Báo cáo"""
+    conn = get_conn()
+    # Lấy 7 ngày dữ liệu gần nhất để báo cáo
     query = f"""
-        SELECT hour_timestamp, open_price, high_price, low_price, close_price, total_volume
-        FROM hourly_stats
+        SELECT 
+            hour_timestamp, open_price, high_price, low_price, close_price, 
+            total_volume, price_volatility, record_count
+        FROM hourly_stats 
         WHERE symbol = '{symbol}'
-        ORDER BY hour_timestamp DESC
-        LIMIT 72
-    """
-    df = pd.read_sql(query, conn)
-    return df.sort_values(by="hour_timestamp")
-
-def get_latest_alerts(limit=10):
-    """Lấy cảnh báo mới nhất"""
-    conn = get_db_connection()
-    query = f"""
-        SELECT timestamp, symbol, alert_type, message, price_after, volume
-        FROM alerts 
-        ORDER BY timestamp DESC 
-        LIMIT {limit}
-    """
+        ORDER BY hour_timestamp DESC LIMIT 168 
+    """ # 168 records = 7 ngày x 24 giờ
     return pd.read_sql(query, conn)
 
-# --- 3. GIAO DIỆN CHÍNH (UI) ---
+# --- CHARTING FUNCTIONS ---
 
-# --- Sidebar: Bộ lọc ---
-st.sidebar.title("🎛️ Control Panel")
-available_symbols = get_symbols()
-if not available_symbols:
-    st.warning("Chưa có dữ liệu trong Database. Hãy chạy Pipeline trước!")
-    st.stop()
+def create_line_chart(df1, symbol1, metric, title, df2=None, symbol2=None):
+    """Tạo biểu đồ đường hỗ trợ so sánh 2 coin"""
+    fig = go.Figure()
 
-selected_symbol = st.sidebar.selectbox("Chọn Crypto:", available_symbols, index=0)
-st.sidebar.markdown("---")
-st.sidebar.info(f"Đang theo dõi: **{selected_symbol}**")
+    # Coin 1
+    fig.add_trace(go.Scatter(
+        x=df1['timestamp'], 
+        y=df1[metric], 
+        mode='lines', 
+        name=f"{metric} ({symbol1})",
+        line=dict(color='#00F0FF', width=2),
+        connectgaps=False # Xử lý ngắt quãng dữ liệu
+    ))
 
-# --- Header: KPI Metrics (Giá hiện tại) ---
-st.title(f"🚀 {selected_symbol} Market Overview")
-
-# Lấy bản ghi mới nhất
-realtime_df = get_realtime_data(selected_symbol, limit=2)
-if not realtime_df.empty:
-    latest = realtime_df.iloc[-1]
-    prev = realtime_df.iloc[-2] if len(realtime_df) > 1 else latest
-    
-    delta_price = latest['price'] - prev['price']
-    delta_percent = (delta_price / prev['price']) * 100 if prev['price'] != 0 else 0
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Giá Hiện Tại", f"${latest['price']:,.2f}", f"{delta_percent:.2f}%")
-    col2.metric("Volume 24H", f"${latest['volume_24h']:,.0f}", "Updated")
-    col3.metric("Cập nhật lúc", latest['timestamp'].strftime('%H:%M:%S'), "Live")
-
-# --- Tabs: Chia giao diện thành các tab chức năng ---
-tab1, tab2, tab3 = st.tabs(["📈 Real-time Analysis", "🕯️ Historical (Batch)", "⚠️ System Alerts"])
-
-# === TAB 1: REAL-TIME CHART ===
-with tab1:
-    st.subheader("Diễn biến giá thực (Streaming)")
-    
-    # Query dữ liệu nhiều hơn để vẽ biểu đồ
-    chart_data = get_realtime_data(selected_symbol, limit=500)
-    
-    if not chart_data.empty:
-        fig = go.Figure()
-        
-        # Đường giá (Price)
+    # Coin 2 (So sánh)
+    if df2 is not None and symbol2:
         fig.add_trace(go.Scatter(
-            x=chart_data['timestamp'], 
-            y=chart_data['price'],
-            mode='lines+markers', # Hiện cả điểm để thấy rõ khi data bị gãy
-            name='Price',
-            line=dict(color='#00F0FF', width=2),
-            marker=dict(size=4)
+            x=df2['timestamp'], 
+            y=df2[metric], 
+            mode='lines', 
+            name=f"{metric} ({symbol2})",
+            line=dict(color='#FFD700', width=2),
+            connectgaps=False
         ))
-        
-        # Đường MA (Moving Average)
-        if chart_data['ma_5min'].notna().any():
+    
+    # Thêm MA (Chỉ thêm cho Coin 1, nếu có)
+    if metric == 'price' and df1['ma_5min'].notna().any():
+        fig.add_trace(go.Scatter(
+            x=df1['timestamp'], y=df1['ma_5min'], name=f"MA 5M ({symbol1})", 
+            line=dict(dash='dot', color='orange', width=1), 
+            visible='legendonly', # Ẩn đi, chỉ hiện khi click vào Legend
+            connectgaps=False
+        ))
+        if 'ma_15min' in df1.columns and df1['ma_15min'].notna().any():
             fig.add_trace(go.Scatter(
-                x=chart_data['timestamp'], 
-                y=chart_data['ma_5min'],
-                mode='lines',
-                name='MA 5min',
-                line=dict(color='#FFA500', width=1, dash='dot')
+                x=df1['timestamp'], y=df1['ma_15min'], name=f"MA 15M ({symbol1})", 
+                line=dict(dash='dot', color='red', width=1), 
+                visible='legendonly', 
+                connectgaps=False
+            ))
+        if 'ma_1hour' in df1.columns and df1['ma_1hour'].notna().any():
+             fig.add_trace(go.Scatter(
+                x=df1['timestamp'], y=df1['ma_1hour'], name=f"MA 1H ({symbol1})", 
+                line=dict(dash='dot', color='green', width=1), 
+                visible='legendonly', 
+                connectgaps=False
             ))
 
-        fig.update_layout(
-            height=500,
-            template="plotly_dark",
-            xaxis_title="Thời gian",
-            yaxis_title="Giá (USD)",
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Đang chờ dữ liệu Streaming...")
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        height=400,
+        xaxis_title="Thời Gian",
+        yaxis_title=metric.replace('_', ' ').title(),
+        hovermode="x unified"
+    )
+    return fig
 
-# === TAB 2: HISTORICAL CHART (CANDLESTICK) ===
+# --- UI SETUP ---
+st.sidebar.title("🎛️ Control Panel")
+coins = get_coin_list()
+
+if coins.empty:
+    st.warning("Đang chờ dữ liệu Realtime... Vui lòng bật Producer.")
+    st.stop()
+
+# --- COIN SELECTION ---
+col_select1, col_select2 = st.sidebar.columns(2)
+selected_symbol1 = col_select1.selectbox("Chọn Coin Chính (1):", coins['symbol'].unique(), key='coin1')
+selected_symbol2 = col_select2.selectbox("Chọn Coin So sánh (2):", [None] + list(coins['symbol'].unique()), key='coin2', index=0)
+
+# Loại bỏ trùng lặp nếu người dùng chọn coin1 = coin2
+if selected_symbol1 == selected_symbol2:
+    selected_symbol2 = None
+
+# --- DATA FETCHING ---
+df1 = get_realtime_data(selected_symbol1)
+df2 = get_realtime_data(selected_symbol2) if selected_symbol2 else None
+
+if df1.empty:
+    st.warning(f"Chưa có dữ liệu realtime cho {selected_symbol1}.")
+    st.stop()
+
+# --- HEADER: METRICS ---
+coin_info1 = coins[coins['symbol'] == selected_symbol1].iloc[0]
+st.header(f"💰 {coin_info1['name']} ({selected_symbol1}) Dashboard")
+
+with st.container():
+    last1 = df1.iloc[-1]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Giá (USD)", f"${last1['price']:,.4f}", f"{last1['price_change_percentage_24h']:.2f}%")
+    c2.metric("Vốn hóa (Market Cap)", f"${last1['market_cap']/1e9:.2f}B")
+    c3.metric("Volume 24H", f"${last1['volume_24h']/1e6:.2f}M")
+    c4.metric("Đỉnh Lịch Sử (ATH)", f"${last1['ath']:,.2f}")
+
+# --- MAIN CHARTS ---
+tab1, tab2 = st.tabs(["📊 Realtime Price & Volume", "📜 Batch Historical Summary"])
+
+with tab1:
+    st.subheader(f"Diễn biến Realtime (Last {len(df1)} records)")
+    
+    # 1. BIỂU ĐỒ PRICE
+    price_title = f"Giá ({selected_symbol1}" + (f" vs {selected_symbol2})" if selected_symbol2 else ")")
+    fig_price = create_line_chart(df1, selected_symbol1, 'price', price_title, df2, selected_symbol2)
+    st.plotly_chart(fig_price, use_container_width=True)
+    
+    # 2. BIỂU ĐỒ VOLUME
+    st.markdown("---")
+    volume_title = f"Volume 24H ({selected_symbol1}" + (f" vs {selected_symbol2})" if selected_symbol2 else ")")
+    fig_volume = create_line_chart(df1, selected_symbol1, 'volume_24h', volume_title, df2, selected_symbol2)
+    st.plotly_chart(fig_volume, use_container_width=True)
+
 with tab2:
-    st.subheader("Dữ liệu tổng hợp theo giờ (Batch Job)")
-    hourly_df = get_hourly_data(selected_symbol)
+    st.subheader(f"Báo cáo Tổng hợp Batch (Hourly) cho {selected_symbol1}")
     
-    if not hourly_df.empty:
-        fig_candle = go.Figure(data=[go.Candlestick(
-            x=hourly_df['hour_timestamp'],
-            open=hourly_df['open_price'],
-            high=hourly_df['high_price'],
-            low=hourly_df['low_price'],
-            close=hourly_df['close_price'],
-            name="OHLC"
-        )])
-        
-        fig_candle.update_layout(
-            height=500,
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-            title=f"Biểu đồ nến {selected_symbol} (Hourly)"
-        )
-        st.plotly_chart(fig_candle, use_container_width=True)
-        
-        with st.expander("Xem dữ liệu thô (Hourly)"):
-            st.dataframe(hourly_df)
-    else:
-        st.warning("Chưa có dữ liệu Batch. Hãy chạy 'spark-submit batch_processor.py'!")
-
-# === TAB 3: ALERTS ===
-with tab3:
-    st.subheader("🔥 Cảnh báo phát hiện từ Spark Streaming")
-    alerts_df = get_latest_alerts(20)
+    # 1. Bảng báo cáo
+    ohlc_df = get_hourly_stats(selected_symbol1)
     
-    if not alerts_df.empty:
-        # Style cho bảng đẹp hơn
-        def highlight_type(val):
-            color = 'red' if 'VOLATILITY' in val else 'orange'
-            return f'color: {color}; font-weight: bold'
-
-        st.dataframe(
-            alerts_df.style.applymap(highlight_type, subset=['alert_type']),
-            use_container_width=True
-        )
+    if not ohlc_df.empty:
+        # Làm sạch và format dữ liệu
+        ohlc_df.rename(columns={
+            'hour_timestamp': 'Giờ', 
+            'open_price': 'Mở', 'close_price': 'Đóng', 
+            'high_price': 'Cao', 'low_price': 'Thấp',
+            'total_volume': 'Tổng Volume', 
+            'price_volatility': 'Biến động (StdDev)', 
+            'record_count': 'SL Bản ghi'
+        }, inplace=True)
+        
+        # Format số liệu
+        ohlc_df['Giờ'] = ohlc_df['Giờ'].dt.strftime('%Y-%m-%d %H:%M')
+        for col in ['Mở', 'Đóng', 'Cao', 'Thấp']:
+            ohlc_df[col] = ohlc_df[col].map('${:,.4f}'.format)
+        ohlc_df['Tổng Volume'] = ohlc_df['Tổng Volume'].map('{:,.0f}'.format)
+        ohlc_df['Biến động (StdDev)'] = ohlc_df['Biến động (StdDev)'].map('{:,.4f}'.format)
+        
+        st.dataframe(ohlc_df, use_container_width=True)
+        
+        # 2. Thông tin tóm tắt
+        st.markdown("---")
+        st.info("💡 Bảng này hiển thị dữ liệu đã được tính toán trong Batch Job, phục vụ phân tích lịch sử và báo cáo (Cold Path).")
+        
     else:
-        st.success("Hệ thống ổn định. Chưa có cảnh báo nào.")
+        st.info("Chưa có dữ liệu Batch (hourly_stats). Vui lòng chạy Batch Job sau khi có dữ liệu Realtime.")

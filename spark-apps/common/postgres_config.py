@@ -1,3 +1,4 @@
+# spark-apps/common/postgres_config.py
 POSTGRES_CONFIG = {
     'host': 'postgres.crypto-bigdata.svc.cluster.local',
     'port': 5432,

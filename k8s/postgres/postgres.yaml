@@ -5,16 +5,21 @@ metadata:
   name: postgres-init
   namespace: crypto-bigdata
 data:
-  init.sql: |    
-    -- 1. Bảng lưu dữ liệu thô Real-time (Từ Spark Streaming)
+  init.sql: |
+    -- 1. Bảng Real-time
     CREATE TABLE IF NOT EXISTS realtime_prices (
         id SERIAL PRIMARY KEY,
         symbol VARCHAR(20) NOT NULL,
         name VARCHAR(100),
+        image TEXT,
         price NUMERIC(20, 8) NOT NULL,
-        volume_24h NUMERIC(30, 2),
         market_cap NUMERIC(30, 2),
-        price_change_24h NUMERIC(10, 4),
+        volume_24h NUMERIC(30, 2),
+        high_24h NUMERIC(20, 8),
+        low_24h NUMERIC(20, 8),
+        ath NUMERIC(20, 8),
+        atl NUMERIC(20, 8),
+        price_change_24h NUMERIC(20, 8),
         price_change_percentage_24h NUMERIC(10, 4),
         ma_5min NUMERIC(20, 8),
         ma_15min NUMERIC(20, 8),
@@ -25,23 +30,19 @@ data:
     CREATE INDEX idx_realtime_prices_symbol ON realtime_prices(symbol);
     CREATE INDEX idx_realtime_prices_timestamp ON realtime_prices(timestamp DESC);
     
-    -- 2. Bảng Alerts (Cảnh báo)
+    -- 2. Bảng Alerts
     CREATE TABLE IF NOT EXISTS alerts (
         id SERIAL PRIMARY KEY,
         symbol VARCHAR(20) NOT NULL,
         alert_type VARCHAR(50) NOT NULL,
         message TEXT,
-        price_before NUMERIC(20, 8),
         price_after NUMERIC(20, 8),
         change_percentage NUMERIC(10, 4),
-        volume NUMERIC(30, 2),
         timestamp TIMESTAMP NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
     );
-    CREATE INDEX idx_alerts_symbol ON alerts(symbol);
-    CREATE INDEX idx_alerts_timestamp ON alerts(timestamp DESC);
 
-    -- 3. Bảng Thống kê theo Giờ (Từ Batch Job)
+    -- 3. Bảng Hourly Stats (Batch)
     CREATE TABLE IF NOT EXISTS hourly_stats (
         id SERIAL PRIMARY KEY,
         symbol VARCHAR(20) NOT NULL,
@@ -52,16 +53,15 @@ data:
         close_price NUMERIC(20, 8),
         avg_price NUMERIC(20, 8),
         total_volume NUMERIC(30, 2),
-        avg_volume NUMERIC(30, 2),
-        avg_market_cap NUMERIC(30, 2),
-        price_volatility NUMERIC(20, 8),
+        avg_volume NUMERIC(30, 2),       -- Khớp với Spark
+        avg_market_cap NUMERIC(30, 2),   -- Khớp với Spark
+        price_volatility NUMERIC(20, 8), -- Khớp với Spark
         record_count INTEGER,
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(symbol, hour_timestamp)
     );
-    CREATE INDEX idx_hourly_stats_symbol ON hourly_stats(symbol);
     
-    -- 4. Bảng Thống kê theo Ngày (Từ Batch Job)
+    -- 4. Bảng Daily Stats (Batch)
     CREATE TABLE IF NOT EXISTS daily_stats (
         id SERIAL PRIMARY KEY,
         symbol VARCHAR(20) NOT NULL,
@@ -72,15 +72,14 @@ data:
         close_price NUMERIC(20, 8),
         avg_price NUMERIC(20, 8),
         total_volume NUMERIC(30, 2),
-        peak_volume NUMERIC(30, 2),
+        peak_volume NUMERIC(30, 2),      -- MỚI: Khớp với Spark
+        volatility NUMERIC(20, 8),       -- MỚI: Khớp với Spark
+        transaction_count INTEGER,       -- MỚI: Khớp với Spark
         price_change_percent NUMERIC(10, 4),
-        volatility NUMERIC(20, 8),
-        transaction_count INTEGER,
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(symbol, day_timestamp)
     );
-    CREATE INDEX idx_daily_stats_symbol ON daily_stats(symbol);
-    
+
 ---
 apiVersion: v1
 kind: Service

@@ -74,9 +74,13 @@ kubectl exec -it -n crypto-bigdata spark-master-5f778b99f7-rpd6z -- bash
 # Run Streamlit Dashboard
 streamlit run dashboard.py
 
+# Submit Batch Processing Job
 /opt/spark/bin/spark-submit \
   --master local[2] \
   --name "BatchProcessor" \
   --conf spark.jars.ivy=/tmp/.ivy2 \
   --packages org.postgresql:postgresql:42.7.1 \
   /tmp/spark-apps/batch/batch_processor.py
+
+# Test HDFS Reader Script
+/opt/spark/bin/spark-submit --master local[2] /tmp/spark-apps/batch/hdfs_reader.py
