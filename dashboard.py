@@ -1,196 +1,453 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import psycopg2
 import plotly.graph_objects as go
+from datetime import timedelta
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Crypto Big Data Dashboard", page_icon="💎", layout="wide")
-st_autorefresh(interval=30000, key="datarefresh") # Refresh sau 30 giây
+# =========================
+# PAGE CONFIG
+# =========================
+st.set_page_config(page_title="Crypto Dashboard", page_icon="💎", layout="wide")
 
 DB_CONFIG = {
     "dbname": "cryptodb",
     "user": "cryptouser",
     "password": "cryptopass123",
     "host": "localhost",
-    "port": "5433" 
+    "port": "5433",
 }
 
+# =========================
+# DB CONNECTION
+# =========================
 @st.cache_resource
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
-# --- QUERY DATA ---
+def _read_sql(query: str, params=None) -> pd.DataFrame:
+    conn = get_conn()
+    return pd.read_sql(query, conn, params=params)
+
+# =========================
+# DATA QUERIES
+# =========================
+@st.cache_data(ttl=600)
 def get_coin_list():
-    conn = get_conn()
-    return pd.read_sql("SELECT DISTINCT symbol, name, image FROM realtime_prices ORDER BY symbol", conn)
+    return _read_sql(
+        """
+        SELECT DISTINCT symbol, name, image
+        FROM realtime_prices
+        ORDER BY symbol
+        """
+    )
 
-def get_realtime_data(symbol, limit=200):
-    """Lấy dữ liệu Realtime cho 1 coin"""
-    conn = get_conn()
-    query = f"""
-        SELECT * FROM realtime_prices 
-        WHERE symbol = '{symbol}' ORDER BY timestamp DESC LIMIT {limit}
-    """
-    # Lấy 200 bản ghi, sau đó sắp xếp lại theo thời gian tăng dần
-    return pd.read_sql(query, conn).sort_values("timestamp")
+@st.cache_data(ttl=30)
+def get_latest_timestamp(symbol: str):
+    df = _read_sql(
+        """
+        SELECT MAX(timestamp) AS max_ts
+        FROM realtime_prices
+        WHERE symbol = %s
+        """,
+        params=(symbol,),
+    )
+    if df.empty or pd.isna(df.loc[0, "max_ts"]):
+        return None
+    return pd.to_datetime(df.loc[0, "max_ts"])
 
-def get_hourly_stats(symbol):
-    """Lấy dữ liệu Batch (hourly) cho Bảng Báo cáo"""
-    conn = get_conn()
-    # Lấy 7 ngày dữ liệu gần nhất để báo cáo
-    query = f"""
-        SELECT 
-            hour_timestamp, open_price, high_price, low_price, close_price, 
+@st.cache_data(ttl=30)
+def get_realtime_data(symbol: str, start_ts=None, end_ts=None, limit: int = 5000) -> pd.DataFrame:
+    if symbol is None:
+        return pd.DataFrame()
+
+    where = ["symbol = %s"]
+    params = [symbol]
+
+    if start_ts is not None:
+        where.append("timestamp >= %s")
+        params.append(start_ts)
+    if end_ts is not None:
+        where.append("timestamp <= %s")
+        params.append(end_ts)
+
+    where_sql = " AND ".join(where)
+
+    df = _read_sql(
+        f"""
+        SELECT
+            symbol, name, image,
+            price, market_cap, volume_24h,
+            high_24h, low_24h, ath, atl,
+            price_change_percentage_24h,
+            ma_5min, ma_15min, ma_1hour,
+            timestamp
+        FROM realtime_prices
+        WHERE {where_sql}
+        ORDER BY timestamp ASC
+        LIMIT %s
+        """,
+        params=tuple(params + [limit]),
+    )
+
+    if df.empty:
+        return df
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    # đảm bảo số liệu vẽ plotly ổn định (NUMERIC/Decimal -> float)
+    numeric_cols = [
+        "price", "market_cap", "volume_24h",
+        "high_24h", "low_24h", "ath", "atl",
+        "price_change_percentage_24h",
+        "ma_5min", "ma_15min", "ma_1hour",
+    ]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df.sort_values("timestamp")
+
+@st.cache_data(ttl=120)
+def get_hourly_stats(symbol: str, limit: int = 168):
+    df = _read_sql(
+        """
+        SELECT
+            hour_timestamp, open_price, high_price, low_price, close_price,
             total_volume, price_volatility, record_count
-        FROM hourly_stats 
-        WHERE symbol = '{symbol}'
-        ORDER BY hour_timestamp DESC LIMIT 168 
-    """ # 168 records = 7 ngày x 24 giờ
-    return pd.read_sql(query, conn)
+        FROM hourly_stats
+        WHERE symbol = %s
+        ORDER BY hour_timestamp DESC
+        LIMIT %s
+        """,
+        params=(symbol, limit),
+    )
+    if not df.empty:
+        df["hour_timestamp"] = pd.to_datetime(df["hour_timestamp"])
+        for c in ["open_price", "high_price", "low_price", "close_price", "total_volume", "price_volatility"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-# --- CHARTING FUNCTIONS ---
+@st.cache_data(ttl=30)
+def get_alerts(symbol: str, limit: int = 80):
+    df = _read_sql(
+        """
+        SELECT alert_type, message, price_after, change_percentage, timestamp
+        FROM alerts
+        WHERE symbol = %s
+        ORDER BY timestamp DESC
+        LIMIT %s
+        """,
+        params=(symbol, limit),
+    )
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        for c in ["price_after", "change_percentage"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-def create_line_chart(df1, symbol1, metric, title, df2=None, symbol2=None):
-    """Tạo biểu đồ đường hỗ trợ so sánh 2 coin"""
+# =========================
+# GAP HANDLING (break lines)
+# =========================
+def insert_gap_breaks(df: pd.DataFrame, time_col: str = "timestamp", gap_minutes: int = 10) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    dfx = df.copy().sort_values(time_col).reset_index(drop=True)
+    threshold = pd.Timedelta(minutes=gap_minutes)
+
+    gap_rows = []
+    for i in range(1, len(dfx)):
+        dt = dfx.loc[i, time_col] - dfx.loc[i - 1, time_col]
+        if dt > threshold:
+            mid_time = dfx.loc[i - 1, time_col] + (dt / 2)
+            row = {c: np.nan for c in dfx.columns}
+            row[time_col] = mid_time
+            gap_rows.append(row)
+
+    if not gap_rows:
+        return dfx
+
+    out = pd.concat([dfx, pd.DataFrame(gap_rows)], ignore_index=True)
+    return out.sort_values(time_col).reset_index(drop=True)
+
+# =========================
+# CHARTS
+# =========================
+def _common_xaxis():
+    return dict(
+        title="Thời gian",
+        type="date",
+    )
+
+def create_price_chart(df1, sym1, df2=None, sym2=None, show_ma=True):
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df1["timestamp"], y=df1["price"], mode="lines",
+                             name=f"Price ({sym1})", connectgaps=False))
 
-    # Coin 1
-    fig.add_trace(go.Scatter(
-        x=df1['timestamp'], 
-        y=df1[metric], 
-        mode='lines', 
-        name=f"{metric} ({symbol1})",
-        line=dict(color='#00F0FF', width=2),
-        connectgaps=False # Xử lý ngắt quãng dữ liệu
-    ))
+    if df2 is not None and sym2:
+        fig.add_trace(go.Scatter(x=df2["timestamp"], y=df2["price"], mode="lines",
+                                 name=f"Price ({sym2})", connectgaps=False))
 
-    # Coin 2 (So sánh)
-    if df2 is not None and symbol2:
-        fig.add_trace(go.Scatter(
-            x=df2['timestamp'], 
-            y=df2[metric], 
-            mode='lines', 
-            name=f"{metric} ({symbol2})",
-            line=dict(color='#FFD700', width=2),
-            connectgaps=False
-        ))
-    
-    # Thêm MA (Chỉ thêm cho Coin 1, nếu có)
-    if metric == 'price' and df1['ma_5min'].notna().any():
-        fig.add_trace(go.Scatter(
-            x=df1['timestamp'], y=df1['ma_5min'], name=f"MA 5M ({symbol1})", 
-            line=dict(dash='dot', color='orange', width=1), 
-            visible='legendonly', # Ẩn đi, chỉ hiện khi click vào Legend
-            connectgaps=False
-        ))
-        if 'ma_15min' in df1.columns and df1['ma_15min'].notna().any():
-            fig.add_trace(go.Scatter(
-                x=df1['timestamp'], y=df1['ma_15min'], name=f"MA 15M ({symbol1})", 
-                line=dict(dash='dot', color='red', width=1), 
-                visible='legendonly', 
-                connectgaps=False
-            ))
-        if 'ma_1hour' in df1.columns and df1['ma_1hour'].notna().any():
-             fig.add_trace(go.Scatter(
-                x=df1['timestamp'], y=df1['ma_1hour'], name=f"MA 1H ({symbol1})", 
-                line=dict(dash='dot', color='green', width=1), 
-                visible='legendonly', 
-                connectgaps=False
-            ))
+    if show_ma and "ma_5min" in df1.columns and df1["ma_5min"].notna().any():
+        fig.add_trace(go.Scatter(x=df1["timestamp"], y=df1["ma_5min"], mode="lines",
+                                 name=f"MA 5m ({sym1})", visible="legendonly",
+                                 line=dict(dash="dot"), connectgaps=False))
+    if show_ma and "ma_15min" in df1.columns and df1["ma_15min"].notna().any():
+        fig.add_trace(go.Scatter(x=df1["timestamp"], y=df1["ma_15min"], mode="lines",
+                                 name=f"MA 15m ({sym1})", visible="legendonly",
+                                 line=dict(dash="dot"), connectgaps=False))
+    if show_ma and "ma_1hour" in df1.columns and df1["ma_1hour"].notna().any():
+        fig.add_trace(go.Scatter(x=df1["timestamp"], y=df1["ma_1hour"], mode="lines",
+                                 name=f"MA 1h ({sym1})", visible="legendonly",
+                                 line=dict(dash="dot"), connectgaps=False))
 
     fig.update_layout(
-        title=title,
         template="plotly_dark",
-        height=400,
-        xaxis_title="Thời Gian",
-        yaxis_title=metric.replace('_', ' ').title(),
-        hovermode="x unified"
+        height=420,
+        title="Realtime Price",
+        hovermode="x unified",
+        xaxis=_common_xaxis(),
+        yaxis=dict(title="USD"),
+        margin=dict(l=10, r=10, t=55, b=10),
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
     )
     return fig
 
-# --- UI SETUP ---
-st.sidebar.title("🎛️ Control Panel")
-coins = get_coin_list()
+def create_volume_chart(df1, sym1, df2=None, sym2=None):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df1["timestamp"], y=df1["volume_24h"], name=f"Volume ({sym1})", opacity=0.75))
+    if df2 is not None and sym2:
+        fig.add_trace(go.Bar(x=df2["timestamp"], y=df2["volume_24h"], name=f"Volume ({sym2})", opacity=0.55))
 
+    fig.update_layout(
+        barmode="overlay",
+        template="plotly_dark",
+        height=360,
+        title="Volume (24h)",
+        hovermode="x unified",
+        xaxis=_common_xaxis(),
+        yaxis=dict(title="Volume"),
+        margin=dict(l=10, r=10, t=55, b=10),
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+    )
+    return fig
+
+def create_hourly_candlestick(ohlc: pd.DataFrame):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=ohlc["hour_timestamp"],
+        open=ohlc["open_price"],
+        high=ohlc["high_price"],
+        low=ohlc["low_price"],
+        close=ohlc["close_price"],
+        name="Hourly"
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        height=420,
+        title="Hourly Candlestick",
+        xaxis=_common_xaxis(),
+        yaxis=dict(title="USD"),
+        margin=dict(l=10, r=10, t=55, b=10),
+    )
+    return fig
+
+# =========================
+# SIDEBAR
+# =========================
+st.sidebar.title("🎛️ Điều khiển")
+
+refresh_on = st.sidebar.toggle("Auto refresh", value=True)
+if refresh_on:
+    st_autorefresh(interval=30_000, key="datarefresh")
+
+coins = get_coin_list()
 if coins.empty:
-    st.warning("Đang chờ dữ liệu Realtime... Vui lòng bật Producer.")
+    st.warning("Chưa có dữ liệu realtime. Hãy bật Producer/Streaming trước.")
     st.stop()
 
-# --- COIN SELECTION ---
-col_select1, col_select2 = st.sidebar.columns(2)
-selected_symbol1 = col_select1.selectbox("Chọn Coin Chính (1):", coins['symbol'].unique(), key='coin1')
-selected_symbol2 = col_select2.selectbox("Chọn Coin So sánh (2):", [None] + list(coins['symbol'].unique()), key='coin2', index=0)
+symbols = list(coins["symbol"].unique())
 
-# Loại bỏ trùng lặp nếu người dùng chọn coin1 = coin2
+c1, c2 = st.sidebar.columns(2)
+selected_symbol1 = c1.selectbox("Coin", symbols, key="coin1")
+selected_symbol2 = c2.selectbox("So sánh", [None] + symbols, key="coin2", index=0)
 if selected_symbol1 == selected_symbol2:
     selected_symbol2 = None
 
-# --- DATA FETCHING ---
-df1 = get_realtime_data(selected_symbol1)
-df2 = get_realtime_data(selected_symbol2) if selected_symbol2 else None
+st.sidebar.divider()
 
-if df1.empty:
-    st.warning(f"Chưa có dữ liệu realtime cho {selected_symbol1}.")
+latest_ts = get_latest_timestamp(selected_symbol1)
+if latest_ts is None:
+    st.warning(f"Chưa có dữ liệu cho {selected_symbol1}.")
     st.stop()
 
-# --- HEADER: METRICS ---
-coin_info1 = coins[coins['symbol'] == selected_symbol1].iloc[0]
-st.header(f"💰 {coin_info1['name']} ({selected_symbol1}) Dashboard")
+range_mode = st.sidebar.selectbox(
+    "Khoảng thời gian",
+    ["30 phút", "1 giờ", "6 giờ", "24 giờ", "7 ngày", "Tùy chọn", "Tất cả"],
+    index=2
+)
 
-with st.container():
-    last1 = df1.iloc[-1]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Giá (USD)", f"${last1['price']:,.4f}", f"{last1['price_change_percentage_24h']:.2f}%")
-    c2.metric("Vốn hóa (Market Cap)", f"${last1['market_cap']/1e9:.2f}B")
-    c3.metric("Volume 24H", f"${last1['volume_24h']/1e6:.2f}M")
-    c4.metric("Đỉnh Lịch Sử (ATH)", f"${last1['ath']:,.2f}")
+gap_minutes = st.sidebar.slider("Ngắt khi mất dữ liệu (phút)", 2, 60, 10, 1)
+max_rows = st.sidebar.slider("Giới hạn số điểm", 200, 20000, 5000, 200)
+show_ma = st.sidebar.toggle("MA (ẩn/hiện bằng legend)", value=True)
 
-# --- MAIN CHARTS ---
-tab1, tab2 = st.tabs(["📊 Realtime Price & Volume", "📜 Batch Historical Summary"])
+start_ts, end_ts = None, None
 
-with tab1:
-    st.subheader(f"Diễn biến Realtime (Last {len(df1)} records)")
-    
-    # 1. BIỂU ĐỒ PRICE
-    price_title = f"Giá ({selected_symbol1}" + (f" vs {selected_symbol2})" if selected_symbol2 else ")")
-    fig_price = create_line_chart(df1, selected_symbol1, 'price', price_title, df2, selected_symbol2)
+def _lookback(latest, delta):
+    return latest - delta, latest
+
+if range_mode == "30 phút":
+    start_ts, end_ts = _lookback(latest_ts, timedelta(minutes=30))
+elif range_mode == "1 giờ":
+    start_ts, end_ts = _lookback(latest_ts, timedelta(hours=1))
+elif range_mode == "6 giờ":
+    start_ts, end_ts = _lookback(latest_ts, timedelta(hours=6))
+elif range_mode == "24 giờ":
+    start_ts, end_ts = _lookback(latest_ts, timedelta(days=1))
+elif range_mode == "7 ngày":
+    start_ts, end_ts = _lookback(latest_ts, timedelta(days=7))
+elif range_mode == "Tùy chọn":
+    slider_min = (latest_ts - timedelta(days=30)).to_pydatetime()
+    slider_max = latest_ts.to_pydatetime()
+    picked = st.sidebar.slider(
+        "Chọn thời gian",
+        min_value=slider_min,
+        max_value=slider_max,
+        value=((latest_ts - timedelta(hours=6)).to_pydatetime(), latest_ts.to_pydatetime()),
+        step=timedelta(minutes=5),
+    )
+    start_ts, end_ts = pd.to_datetime(picked[0]), pd.to_datetime(picked[1])
+elif range_mode == "Tất cả":
+    start_ts, end_ts = None, None
+
+# =========================
+# FETCH DATA
+# =========================
+df1 = get_realtime_data(selected_symbol1, start_ts=start_ts, end_ts=end_ts, limit=max_rows)
+df2 = get_realtime_data(selected_symbol2, start_ts=start_ts, end_ts=end_ts, limit=max_rows) if selected_symbol2 else None
+
+if df1.empty:
+    st.warning("Không có dữ liệu trong khoảng thời gian đã chọn.")
+    st.stop()
+
+df1p = insert_gap_breaks(df1, gap_minutes=gap_minutes)
+df2p = insert_gap_breaks(df2, gap_minutes=gap_minutes) if df2 is not None and not df2.empty else None
+
+# =========================
+# HEADER
+# =========================
+coin_info1 = coins[coins["symbol"] == selected_symbol1].iloc[0]
+h1, h2 = st.columns([1, 6], vertical_alignment="center")
+with h1:
+    if pd.notna(coin_info1.get("image", None)) and coin_info1["image"]:
+        st.image(coin_info1["image"], width=70)
+with h2:
+    st.title(f"{coin_info1['name']} ({selected_symbol1})")
+
+last_valid = df1.dropna(subset=["price"]).iloc[-1]
+last_ts = pd.to_datetime(last_valid["timestamp"])
+fresh_mins = (pd.Timestamp.now() - last_ts).total_seconds() / 60.0
+
+m1, m2, m3, m4, m5 = st.columns([1.1, 1.1, 1.1, 1.1, 1.7])
+m1.metric("Giá (USD)", f"${float(last_valid['price']):,.4f}", f"{float(last_valid['price_change_percentage_24h']):.2f}%")
+m2.metric("Market Cap", f"${float(last_valid['market_cap'])/1e9:.2f}B" if pd.notna(last_valid["market_cap"]) else "—")
+m3.metric("Volume 24H", f"${float(last_valid['volume_24h'])/1e6:.2f}M" if pd.notna(last_valid["volume_24h"]) else "—")
+m4.metric("ATH", f"${float(last_valid['ath']):,.2f}" if pd.notna(last_valid["ath"]) else "—")
+with m5:
+    st.info(f"Cập nhật: {last_ts.strftime('%Y-%m-%d %H:%M:%S')}  •  ~{fresh_mins:.1f} phút trước")
+
+st.divider()
+
+# =========================
+# MAIN NAV (no st.tabs -> avoid reset)
+# =========================
+if "main_view" not in st.session_state:
+    st.session_state["main_view"] = "🔥 Realtime"
+
+main_view = st.segmented_control(
+    "",
+    options=["🔥 Realtime", "🧊 Batch", "🚨 Alerts"],
+    key="main_view",
+)
+# =========================
+# VIEWS
+# =========================
+if main_view == "🔥 Realtime":
+    st.subheader("Realtime")
+
+    fig_price = create_price_chart(df1p, selected_symbol1, df2p, selected_symbol2, show_ma=show_ma)
     st.plotly_chart(fig_price, use_container_width=True)
-    
-    # 2. BIỂU ĐỒ VOLUME
-    st.markdown("---")
-    volume_title = f"Volume 24H ({selected_symbol1}" + (f" vs {selected_symbol2})" if selected_symbol2 else ")")
-    fig_volume = create_line_chart(df1, selected_symbol1, 'volume_24h', volume_title, df2, selected_symbol2)
-    st.plotly_chart(fig_volume, use_container_width=True)
 
-with tab2:
-    st.subheader(f"Báo cáo Tổng hợp Batch (Hourly) cho {selected_symbol1}")
-    
-    # 1. Bảng báo cáo
-    ohlc_df = get_hourly_stats(selected_symbol1)
-    
-    if not ohlc_df.empty:
-        # Làm sạch và format dữ liệu
-        ohlc_df.rename(columns={
-            'hour_timestamp': 'Giờ', 
-            'open_price': 'Mở', 'close_price': 'Đóng', 
-            'high_price': 'Cao', 'low_price': 'Thấp',
-            'total_volume': 'Tổng Volume', 
-            'price_volatility': 'Biến động (StdDev)', 
-            'record_count': 'SL Bản ghi'
-        }, inplace=True)
-        
-        # Format số liệu
-        ohlc_df['Giờ'] = ohlc_df['Giờ'].dt.strftime('%Y-%m-%d %H:%M')
-        for col in ['Mở', 'Đóng', 'Cao', 'Thấp']:
-            ohlc_df[col] = ohlc_df[col].map('${:,.4f}'.format)
-        ohlc_df['Tổng Volume'] = ohlc_df['Tổng Volume'].map('{:,.0f}'.format)
-        ohlc_df['Biến động (StdDev)'] = ohlc_df['Biến động (StdDev)'].map('{:,.4f}'.format)
-        
-        st.dataframe(ohlc_df, use_container_width=True)
-        
-        # 2. Thông tin tóm tắt
-        st.markdown("---")
-        st.info("💡 Bảng này hiển thị dữ liệu đã được tính toán trong Batch Job, phục vụ phân tích lịch sử và báo cáo (Cold Path).")
-        
+    st.markdown("—")
+    fig_vol = create_volume_chart(df1p, selected_symbol1, df2p, selected_symbol2)
+    st.plotly_chart(fig_vol, use_container_width=True)
+
+    with st.expander("Xem dữ liệu (mới nhất)", expanded=False):
+        cols_show = [
+            "timestamp", "price", "market_cap", "volume_24h",
+            "high_24h", "low_24h", "price_change_percentage_24h",
+            "ma_5min", "ma_15min", "ma_1hour"
+        ]
+        cols_show = [c for c in cols_show if c in df1.columns]
+        st.dataframe(df1[cols_show].tail(300), use_container_width=True)
+
+    st.download_button(
+        "⬇️ Tải CSV (realtime)",
+        data=df1.to_csv(index=False).encode("utf-8"),
+        file_name=f"realtime_{selected_symbol1}.csv",
+        mime="text/csv",
+    )
+
+elif main_view == "🧊 Batch":
+    st.subheader("Batch")
+
+    ohlc = get_hourly_stats(selected_symbol1, limit=168)
+    if ohlc.empty:
+        st.info("Chưa có dữ liệu batch. Hãy chạy batch job để tạo báo cáo.")
     else:
-        st.info("Chưa có dữ liệu Batch (hourly_stats). Vui lòng chạy Batch Job sau khi có dữ liệu Realtime.")
+        ohlc_sorted = ohlc.sort_values("hour_timestamp")
+        st.plotly_chart(create_hourly_candlestick(ohlc_sorted), use_container_width=True)
+
+        table = ohlc.sort_values("hour_timestamp", ascending=False).copy()
+        table.rename(columns={
+            "hour_timestamp": "Giờ",
+            "open_price": "Mở", "high_price": "Cao", "low_price": "Thấp", "close_price": "Đóng",
+            "total_volume": "Tổng Volume",
+            "price_volatility": "Volatility",
+            "record_count": "Số bản ghi",
+        }, inplace=True)
+
+        table["Giờ"] = table["Giờ"].dt.strftime("%Y-%m-%d %H:%M")
+        for c in ["Mở", "Đóng", "Cao", "Thấp"]:
+            if c in table.columns:
+                table[c] = table[c].map(lambda x: f"${float(x):,.4f}" if pd.notna(x) else "—")
+        if "Tổng Volume" in table.columns:
+            table["Tổng Volume"] = table["Tổng Volume"].map(lambda x: f"{float(x):,.0f}" if pd.notna(x) else "—")
+        if "Volatility" in table.columns:
+            table["Volatility"] = table["Volatility"].map(lambda x: f"{float(x):,.6f}" if pd.notna(x) else "—")
+
+        st.dataframe(table, use_container_width=True)
+
+else:
+    st.subheader("Alerts")
+    alerts = get_alerts(selected_symbol1, limit=80)
+    if alerts.empty:
+        st.info("Chưa có cảnh báo.")
+    else:
+        disp = alerts.copy()
+        disp.rename(columns={
+            "alert_type": "Loại",
+            "message": "Nội dung",
+            "price_after": "Giá",
+            "change_percentage": "% thay đổi",
+            "timestamp": "Thời gian",
+        }, inplace=True)
+        disp["Thời gian"] = disp["Thời gian"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        disp["Giá"] = disp["Giá"].map(lambda x: f"${float(x):,.4f}" if pd.notna(x) else "—")
+        disp["% thay đổi"] = disp["% thay đổi"].map(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "—")
+        st.dataframe(disp, use_container_width=True)
+
+st.caption("Tip: Nếu bạn tắt hệ thống vài ngày, hãy dùng khoảng 6h/24h để nhìn biến động rõ hơn.")
