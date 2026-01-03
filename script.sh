@@ -52,9 +52,10 @@ kubectl exec -n crypto-bigdata spark-master-5f778b99f7-rpd6z -- mkdir -p /tmp/sp
 kubectl exec -n crypto-bigdata spark-master-5f778b99f7-rpd6z -- mkdir -p /tmp/spark-apps/streaming
 
 kubectl cp spark-apps/common/postgres_config.py spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/common/
+kubectl cp spark-apps/streaming/config.py spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/streaming/
+kubectl cp spark-apps/streaming/realtime_processor.py spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/streaming/
 kubectl cp spark-apps/batch/batch_processor.py crypto-bigdata/spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/batch/
 kubectl cp spark-apps/batch/hdfs_reader.py crypto-bigdata/spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/batch/
-kubectl cp spark-apps/streaming/realtime_processor.py spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/streaming/
 
 # Alternative method
 kubectl cp spark-apps/common/postgres_config.py spark-master-5f778b99f7-rpd6z:/tmp/spark-apps/common/postgres_config.py

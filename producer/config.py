@@ -3,9 +3,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-
-ENV_PATH = BASE_DIR / ".env"
+# Try to locate .env from project root safely (backward compatible)
+THIS_FILE = Path(__file__).resolve()
+CANDIDATES = [
+    THIS_FILE.parents[2] / ".env",  # keep your original intent
+    THIS_FILE.parents[1] / ".env",
+    THIS_FILE.parents[0] / ".env",
+]
+ENV_PATH = next((p for p in CANDIDATES if p.exists()), CANDIDATES[0])
 
 load_dotenv(dotenv_path=ENV_PATH)
 

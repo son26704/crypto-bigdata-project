@@ -1,11 +1,14 @@
 # spark-apps/batch/batch_processor.py
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, avg, min, max, sum, count, stddev,
-    date_trunc, current_timestamp, to_timestamp, lit, to_date
+    col, avg, min, max, count, stddev,
+    date_trunc, current_timestamp, to_timestamp, lit, to_date,
+    unix_timestamp, first, last
 )
+from pyspark.sql.window import Window
 from datetime import timedelta
-from typing import List
+from typing import List, Optional
+from datetime import datetime
 
 POSTGRES_JDBC_URL = "jdbc:postgresql://postgres.crypto-bigdata.svc.cluster.local:5432/cryptodb"
 POSTGRES_PROPERTIES = {
@@ -25,15 +28,6 @@ def create_spark_session():
         .config("spark.hadoop.dfs.datanode.use.datanode.hostname", "true") \
         .getOrCreate()
 
-
-def read_data(spark):
-    print(">>> Reading data from Realtime Prices...")
-    df = spark.read.jdbc(
-        url=POSTGRES_JDBC_URL,
-        table="realtime_prices",
-        properties=POSTGRES_PROPERTIES
-    )
-    return df.withColumn("timestamp", to_timestamp(col("timestamp")))
 
 def execute_sql(spark, sql: str):
     jvm = spark._sc._gateway.jvm
@@ -60,6 +54,7 @@ def execute_sql(spark, sql: str):
     finally:
         conn.close()
 
+
 def ensure_state_table(spark):
     sql = """
     CREATE TABLE IF NOT EXISTS batch_job_state (
@@ -80,7 +75,6 @@ def get_last_processed(spark, job_name: str):
 
 
 def set_last_processed(spark, job_name: str, ts):
-    # ts là python datetime (Spark collect ra)
     sql = f"""
     INSERT INTO batch_job_state(job_name, last_processed_at)
     VALUES ('{job_name}', '{ts.isoformat()}')
@@ -90,46 +84,114 @@ def set_last_processed(spark, job_name: str, ts):
     execute_sql(spark, sql)
 
 
+def _read_realtime_prices_incremental(
+    spark,
+    start_ts: Optional[datetime],
+    # you can also pass end_ts if you ever want bounded reads
+) :
+    """
+    Read realtime_prices with JDBC predicate pushdown (reads less than full table).
+    If start_ts is None => reads full table (first run).
+    """
+    print(">>> Reading data from Realtime Prices...")
+
+    if start_ts is None:
+        df = spark.read.jdbc(
+            url=POSTGRES_JDBC_URL,
+            table="realtime_prices",
+            properties=POSTGRES_PROPERTIES
+        )
+        return df.withColumn("timestamp", to_timestamp(col("timestamp")))
+
+    start_str = start_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    # predicates: Spark will create one JDBC partition per predicate.
+    # With small data, one predicate is fine and still gives pushdown filtering.
+    predicates = [f"timestamp >= '{start_str}'"]
+
+    df = spark.read.jdbc(
+        url=POSTGRES_JDBC_URL,
+        table="realtime_prices",
+        properties=POSTGRES_PROPERTIES,
+        predicates=predicates
+    )
+    return df.withColumn("timestamp", to_timestamp(col("timestamp")))
+
+
 # ---------- Processors ----------
 def process_hourly(df):
+    """
+    Hourly candle:
+      - open_price  = first(price) by timestamp within hour
+      - close_price = last(price)  by timestamp within hour
+      - low/high/avg = min/max/avg price within hour
+    Volume:
+      - total_volume uses max(volume_24h) (rolling 24h snapshot) to avoid meaningless sum explosion
+      - avg_volume stays as avg(volume_24h)
+    """
     print(">>> Processing Hourly Stats...")
-    return df.groupBy(
-        "symbol",
-        date_trunc("hour", col("timestamp")).alias("hour_timestamp")
-    ).agg(
+
+    base = df.withColumn("hour_timestamp", date_trunc("hour", col("timestamp"))) \
+             .withColumn("__ts_sec", unix_timestamp(col("timestamp")))
+
+    w = Window.partitionBy("symbol", "hour_timestamp").orderBy(col("__ts_sec"))
+
+    with_oc = base.withColumn("__open", first(col("price"), ignorenulls=True).over(w)) \
+                  .withColumn("__close", last(col("price"), ignorenulls=True).over(w))
+
+    hourly = with_oc.groupBy("symbol", "hour_timestamp").agg(
         min("price").alias("low_price"),
         max("price").alias("high_price"),
         avg("price").alias("avg_price"),
-        min("price").alias("open_price"),
-        max("price").alias("close_price"),
-        sum("volume_24h").alias("total_volume"),
+        max("__open").alias("open_price"),
+        max("__close").alias("close_price"),
+        # volume_24h is rolling snapshot -> use max as representative for the hour
+        max("volume_24h").alias("total_volume"),
         avg("volume_24h").alias("avg_volume"),
         avg("market_cap").alias("avg_market_cap"),
         stddev("price").alias("price_volatility"),
-        count("*").alias("record_count")
+        count("*").alias("record_count"),
     ).withColumn("created_at", current_timestamp())
+
+    return hourly
 
 
 def process_daily(df):
+    """
+    Daily candle:
+      - day key uses DATE (day_timestamp) to avoid timezone drift in uniqueness
+      - open/close computed by first/last price ordered by timestamp within day
+    Volume:
+      - total_volume uses max(volume_24h) (rolling snapshot)
+      - peak_volume stays max(volume_24h)
+    """
     print(">>> Processing Daily Stats...")
-    return df.groupBy(
-        "symbol",
-        # daily key nên là DATE để đúng unique constraint (đỡ lệch timezone/ts)
-        to_date(date_trunc("day", col("timestamp"))).alias("day_timestamp")
-    ).agg(
+
+    base = df.withColumn("day_timestamp", to_date(date_trunc("day", col("timestamp")))) \
+             .withColumn("__ts_sec", unix_timestamp(col("timestamp")))
+
+    w = Window.partitionBy("symbol", "day_timestamp").orderBy(col("__ts_sec"))
+
+    with_oc = base.withColumn("__open", first(col("price"), ignorenulls=True).over(w)) \
+                  .withColumn("__close", last(col("price"), ignorenulls=True).over(w))
+
+    daily = with_oc.groupBy("symbol", "day_timestamp").agg(
         min("price").alias("low_price"),
         max("price").alias("high_price"),
         avg("price").alias("avg_price"),
-        min("price").alias("open_price"),
-        max("price").alias("close_price"),
-        sum("volume_24h").alias("total_volume"),
+        max("__open").alias("open_price"),
+        max("__close").alias("close_price"),
+        # rolling 24h snapshot -> use max to represent the day, not sum
+        max("volume_24h").alias("total_volume"),
         max("volume_24h").alias("peak_volume"),
         stddev("price").alias("volatility"),
-        count("*").alias("transaction_count")
+        count("*").alias("transaction_count"),
     ).withColumn(
         "price_change_percent",
         ((col("close_price") - col("open_price")) / col("open_price") * 100)
     ).withColumn("created_at", current_timestamp())
+
+    return daily
 
 
 # ---------- UPSERT via staging ----------
@@ -142,7 +204,6 @@ def upsert_to_db(spark, df, target_table: str, key_cols: List[str]):
     print(f">>> UPSERT to DB Table: {target_table}...")
     staging = f"{target_table}__staging"
 
-    # 1) staging overwrite (tạo bảng staging mới mỗi lần)
     df.write.jdbc(
         url=POSTGRES_JDBC_URL,
         table=staging,
@@ -154,7 +215,6 @@ def upsert_to_db(spark, df, target_table: str, key_cols: List[str]):
     q_cols = ", ".join([f'"{c}"' for c in cols])
     q_keys = ", ".join([f'"{k}"' for k in key_cols])
 
-    # update tất cả cột không nằm trong key
     non_keys = [c for c in cols if c not in key_cols]
     set_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in non_keys])
 
@@ -172,7 +232,6 @@ def upsert_to_db(spark, df, target_table: str, key_cols: List[str]):
         print(f"✗ Error upserting DB: {e}")
         raise
     finally:
-        # dọn staging
         try:
             execute_sql(spark, f'DROP TABLE IF EXISTS "{staging}";')
         except Exception:
@@ -194,20 +253,44 @@ def main():
 
     ensure_state_table(spark)
 
-    raw_df = read_data(spark)
-    if raw_df.count() == 0:
+    # ===== Determine incremental starts with lookback =====
+    last_hourly = get_last_processed(spark, "hourly")
+    hourly_start = (last_hourly - timedelta(hours=2)) if last_hourly else None
+
+    last_daily = get_last_processed(spark, "daily")
+    daily_start = (last_daily - timedelta(days=2)) if last_daily else None
+
+    # Read only what we need:
+    # - Hourly needs >= hourly_start
+    # - Daily needs >= daily_start
+    # We'll read from the earliest of the two to reuse the same DF for both computations.
+    if hourly_start is None and daily_start is None:
+        global_start = None
+    elif hourly_start is None:
+        global_start = daily_start
+    elif daily_start is None:
+        global_start = hourly_start
+    else:
+        import builtins
+        global_start = builtins.min(hourly_start, daily_start)
+
+    raw_df = _read_realtime_prices_incremental(spark, global_start)
+
+    # Quick emptiness check without full count scan
+    if len(raw_df.select("symbol").take(1)) == 0:
         print("No data found!")
+        spark.stop()
         return
 
-    # max timestamp hiện có (mốc tiến độ)
+    # max timestamp in the read window (progress marker)
     max_ts = raw_df.agg(max(col("timestamp")).alias("mx")).collect()[0]["mx"]
+    if max_ts is None:
+        print("No valid timestamps in data!")
+        spark.stop()
+        return
 
-    # ===== Hourly incremental window =====
-    last_hourly = get_last_processed(spark, "hourly")
-    # lookback để cập nhật các giờ gần đây (late data)
-    hourly_start = (last_hourly - timedelta(hours=2)) if last_hourly else None
+    # ===== Hourly =====
     hourly_src = raw_df if hourly_start is None else raw_df.filter(col("timestamp") >= lit(hourly_start))
-
     hourly_df = process_hourly(hourly_src)
     hourly_df.show(5)
 
@@ -216,11 +299,8 @@ def main():
 
     set_last_processed(spark, "hourly", max_ts)
 
-    # ===== Daily incremental window =====
-    last_daily = get_last_processed(spark, "daily")
-    daily_start = (last_daily - timedelta(days=2)) if last_daily else None
+    # ===== Daily =====
     daily_src = raw_df if daily_start is None else raw_df.filter(col("timestamp") >= lit(daily_start))
-
     daily_df = process_daily(daily_src)
     daily_df.show(5)
 
