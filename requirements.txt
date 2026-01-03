@@ -1,0 +1,21 @@
+# Kafka
+kafka-python==2.0.2
+
+# HTTP requests
+requests==2.31.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Streamlit dashboard
+streamlit==1.29.0
+streamlit-autorefresh==1.0.1
+
+# Data processing
+pandas==2.1.4
+
+# Database
+psycopg2-binary==2.9.9
+
+# Visualization
+plotly==5.18.0
