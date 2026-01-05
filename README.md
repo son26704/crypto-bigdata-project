@@ -8,25 +8,7 @@
 
 ## 📊 Architecture Overview
 
-```
-┌─────────────┐     ┌───────┐     ┌──────────────────┐     ┌────────────┐     ┌───────────┐
-│ CoinGecko   │────▶│ Kafka │────▶│ Spark Streaming  │────▶│ PostgreSQL │────▶│ Dashboard │
-│     API     │     │       │     │   (Real-time)    │     │            │     │ Streamlit │
-└─────────────┘     └───────┘     └──────────────────┘     └────────────┘     └───────────┘
-                                           │                       ▲
-                                           │                       │
-                                           ▼                       │
-                                   ┌──────────────────┐           │
-                                   │  Spark Batch     │───────────┘
-                                   │ (Hourly/Daily)   │
-                                   └──────────────────┘
-                                           │
-                                           ▼
-                                   ┌──────────────────┐
-                                   │      HDFS        │
-                                   │   (Parquet)      │
-                                   └──────────────────┘
-```
+![Architecture Overview](docs/crypto.drawio.png)
 
 ## ✨ Features
 
@@ -74,9 +56,6 @@
 ### 1. Initial Setup (First Time Only)
 
 ```bash
-# Clone repository (if not done)
-cd /home/son/Documents/crypto-bigdata-project
-
 # Run setup script to install all dependencies
 ./setup.sh
 
@@ -393,11 +372,3 @@ Feel free to open issues or submit pull requests for improvements.
 ## 📄 License
 
 This project is for educational purposes.
-
-## 👤 Author
-
-**Son Nguyen**
-
----
-
-**Happy Data Engineering! 🚀📊**
